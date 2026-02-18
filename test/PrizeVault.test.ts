@@ -43,6 +43,12 @@ function expectedSplit503020(prize: bigint, winnersCount: number): bigint[] {
   return exp;
 }
 
+async function advanceToEndAndMature(vault: any) {
+  const end = await vault.drawEndTimestamp();
+  const hold = await vault.minHoldForEligibility(); // bigint
+  await time.increaseTo(end + 1n + hold);
+}
+
 describe("PrizeVault", function () {
   async function fixture() {
     const [owner, treasury, keeper, alice, bob, carol, other] =
@@ -66,6 +72,7 @@ describe("PrizeVault", function () {
     const keeperBps = 100; // 1%
     const btcConfirmations = 6;
     const emergencyDelay = 200; // seconds
+    const minHoldForEligibilitySeconds = 24 * 60 * 60; // minHoldForEligibilitySeconds (24hs)
 
     const vault = await PrizeVault.deploy(
       await doc.getAddress(),
@@ -74,6 +81,7 @@ describe("PrizeVault", function () {
       owner.address,
       treasury.address,
       drawPeriod,
+      minHoldForEligibilitySeconds,
       treasuryBps,
       keeperBps,
       btcConfirmations,
@@ -122,6 +130,7 @@ describe("PrizeVault", function () {
           owner.address,
           treasury.address,
           100,
+          24 * 60 * 60,
           900,
           100,
           6,
@@ -139,6 +148,7 @@ describe("PrizeVault", function () {
           ethers.ZeroAddress,
           treasury.address,
           100,
+          24 * 60 * 60,
           900,
           100,
           6,
@@ -158,6 +168,7 @@ describe("PrizeVault", function () {
           owner.address,
           ethers.ZeroAddress,
           100,
+          24 * 60 * 60,
           900,
           100,
           6,
@@ -175,6 +186,7 @@ describe("PrizeVault", function () {
           owner.address,
           treasury.address,
           0,
+          24 * 60 * 60,
           900,
           100,
           6,
@@ -192,6 +204,7 @@ describe("PrizeVault", function () {
           owner.address,
           treasury.address,
           100,
+          24 * 60 * 60,
           9000,
           2000,
           6,
@@ -209,6 +222,7 @@ describe("PrizeVault", function () {
           owner.address,
           treasury.address,
           100,
+          24 * 60 * 60,
           900,
           100,
           6,
@@ -523,8 +537,7 @@ describe("PrizeVault", function () {
       // create yield: +1000 DOC on strategy
       await doc.mint(await strategy.getAddress(), bn("1000"));
 
-      const end = await vault.drawEndTimestamp();
-      await time.increaseTo(end + 1n);
+      await advanceToEndAndMature(vault);
 
       const y = bn("1000");
       const treasFee = (y * 900n) / 10_000n; // 90
@@ -645,8 +658,7 @@ describe("PrizeVault", function () {
 
       await doc.mint(await strategy.getAddress(), bn("40"));
 
-      const end = await vault.drawEndTimestamp();
-      await time.increaseTo(end + 1n);
+      await advanceToEndAndMature(vault);
 
       await vault.connect(owner).closeDraw();
       expect(await vault.isLocked()).to.eq(true);
@@ -774,8 +786,7 @@ describe("PrizeVault", function () {
 
       await doc.mint(await strategy.getAddress(), bn("10"));
 
-      const end = await vault.drawEndTimestamp();
-      await time.increaseTo(end + 1n);
+      await advanceToEndAndMature(vault);
 
       await vault.connect(owner).closeDraw();
       expect(await vault.isLocked()).to.eq(true);
@@ -1001,4 +1012,113 @@ describe("PrizeVault", function () {
     await expect(vault.connect(owner).closeDraw())
       .to.be.revertedWithCustomError(vault, "FenwickRepairInProgress");
   });
+  describe("sponsors / noTickets", function () {
+    it("setNoTickets: onlyOwner, blocks zero/locked/emergency", async () => {
+      const { vault, strategy, owner, keeper, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // onlyOwner
+      await expect(vault.connect(keeper).setNoTickets(alice.address, true))
+        .to.be.revertedWithCustomError(vault, "OwnableUnauthorizedAccount")
+        .withArgs(keeper.address);
+
+      // zero addr
+      await expect(vault.connect(owner).setNoTickets(ethers.ZeroAddress, true))
+        .to.be.revertedWithCustomError(vault, "ZeroAddress");
+
+      // emergency blocks
+      await vault.connect(owner).setEmergencyMode(true);
+      await expect(vault.connect(owner).setNoTickets(alice.address, true))
+        .to.be.revertedWithCustomError(vault, "EmergencyModeEnabled");
+      await vault.connect(owner).setEmergencyMode(false);
+
+      // lock blocks
+      await doc.connect(alice).approve(await vault.getAddress(), bn("10"));
+      await vault.connect(alice).deposit(bn("10"));
+      await doc.mint(await strategy.getAddress(), bn("1")); // yield>0 so it locks
+
+      const end = await vault.drawEndTimestamp();
+      await time.increaseTo(end + 1n);
+      await vault.connect(keeper).closeDraw();
+      expect(await vault.isLocked()).to.eq(true);
+
+      await expect(vault.connect(owner).setNoTickets(alice.address, true))
+        .to.be.revertedWithCustomError(vault, "VaultLocked");
+    });
+
+    it("sponsor deposits do NOT create tickets; toggling restores tickets", async () => {
+      const { vault, strategy, owner, alice, bob, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // mark alice as sponsor
+      await expect(vault.connect(owner).setNoTickets(alice.address, true))
+        .to.emit(vault, "NoTicketsSet")
+        .withArgs(alice.address, true);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("1000"));
+      await doc.connect(bob).approve(await vault.getAddress(), bn("200"));
+
+      await vault.connect(alice).deposit(bn("1000"));
+      await vault.connect(bob).deposit(bn("200"));
+
+      // principal includes both
+      expect(await vault.totalPrincipal()).to.eq(bn("1200"));
+
+      // tickets exclude sponsor
+      expect(await vault.totalTickets()).to.eq(bn("200"));
+
+      // now enable alice tickets again => tickets should include her balance
+      await vault.connect(owner).setNoTickets(alice.address, false);
+      expect(await vault.totalTickets()).to.eq(bn("1200"));
+
+      // disable again
+      await vault.connect(owner).setNoTickets(alice.address, true);
+      expect(await vault.totalTickets()).to.eq(bn("200"));
+    });
+
+    it("sponsor can NEVER be picked as winner (even if whale)", async () => {
+      const { vault, strategy, owner, keeper, alice, bob, carol, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Alice is whale sponsor
+      await vault.connect(owner).setNoTickets(alice.address, true);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("1000000"));
+      await doc.connect(bob).approve(await vault.getAddress(), bn("10"));
+      await doc.connect(carol).approve(await vault.getAddress(), bn("10"));
+
+      await vault.connect(alice).deposit(bn("1000000"));
+      await vault.connect(bob).deposit(bn("10"));
+      await vault.connect(carol).deposit(bn("10"));
+
+      // tickets should only be bob+carol
+      expect(await vault.totalTickets()).to.eq(bn("20"));
+
+      // create yield so it locks
+      await doc.mint(await strategy.getAddress(), bn("100"));
+
+      const end = await vault.drawEndTimestamp();
+      await time.increaseTo(end + 1n);
+
+      await vault.connect(keeper).closeDraw();
+      expect(await vault.isLocked()).to.eq(true);
+
+      const seed = ethers.id("seed-sponsor-excluded");
+      await vault.connect(owner).awardDrawManual(1n, seed);
+
+      const [wc, winnersFixed] = await vault.getWinners(1n);
+      const winnersCount = Number(wc);
+      const winnersArr = winnersFixed as unknown as [string, string, string];
+      const winners = winnersArr.slice(0, winnersCount).map(w => w.toLowerCase());
+
+      expect(winners).to.not.include(alice.address.toLowerCase());
+      for (const w of winners) {
+        expect([bob.address.toLowerCase(), carol.address.toLowerCase()]).to.include(w);
+      }
+    });
+  });
+
 });

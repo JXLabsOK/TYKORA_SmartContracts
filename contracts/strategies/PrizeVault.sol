@@ -92,6 +92,8 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     event FenwickRepairStarted(uint256 n);
     event FenwickRepairProgress(uint8 phase, uint256 nextIndex);
     event FenwickRepairFinished(uint256 totalTicketsAfter);
+    event LastDepositAtUpdated(address indexed user, uint64 ts);
+    event NoTicketsSet(address indexed account, bool enabled);
 
     // ---------- config ----------
     IERC20 public immutable underlying;
@@ -108,6 +110,13 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     uint64 public immutable emergencyDelay;
 
     IRskBridge public immutable bridge;
+
+    // ---------- eligibility cooldown (V1) ----------
+    uint64 public immutable minHoldForEligibility; // e.g. 24 hours
+    mapping(address => uint64) public lastDepositAt;
+
+    // ---------- Sponsors ----------
+    mapping(address => bool) public noTickets; // true => deposit but do NOT participate in the draw
 
     // ---------- accounting ----------
     uint256 public totalPrincipal;
@@ -193,6 +202,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         address _owner,
         address _treasury,
         uint64 _drawPeriodSeconds,
+        uint64 _minHoldForEligibilitySeconds,
         uint16 _treasuryBps,
         uint16 _keeperBps,
         uint32 _btcConfirmations,
@@ -208,6 +218,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         treasury = _treasury;
 
         drawPeriod = _drawPeriodSeconds;
+        minHoldForEligibility = _minHoldForEligibilitySeconds;
         treasuryBps = _treasuryBps;
         keeperBps = _keeperBps;
 
@@ -311,6 +322,36 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         return (d.winnersCount, d.winners, d.winnerPrizes);
     }
 
+    function setNoTickets(address account, bool enabled)
+        external
+        onlyOwner
+        whenNotRepairingOrEmergency
+    {
+        if (emergencyMode) revert EmergencyModeEnabled();
+        if (account == address(0)) revert ZeroAddress();
+        if (isLocked) revert VaultLocked();
+
+        if (noTickets[account] == enabled) return;
+        noTickets[account] = enabled;
+
+        // Resync Fenwick:
+        // - if enabled => weight 0 (removes it from the tree)
+        // - if disabled => weight = balance (adds it to the tree if it has shares)
+        if (enabled) {
+            _setWeight(account, 0);
+        } else {
+            // IMPORTANT: prevent cooldown bypass when re-enabling tickets
+            if (minHoldForEligibility != 0) {
+                uint64 ts = uint64(block.timestamp);
+                lastDepositAt[account] = ts;
+                emit LastDepositAtUpdated(account, ts);
+            }
+            _syncWeight(account);
+        }
+
+        emit NoTicketsSet(account, enabled);
+    }
+
     // ---------- user flows ----------
     function deposit(uint256 amount) external nonReentrant whenNotLocked whenNotEmergency whenNotRepairingOrEmergency {
         if (amount == 0) revert ZeroAmount();
@@ -323,6 +364,12 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
         totalPrincipal += amount;
         _mint(msg.sender, amount);
+
+        if (minHoldForEligibility != 0 && !noTickets[msg.sender]) {
+            uint64 ts = uint64(block.timestamp);
+            lastDepositAt[msg.sender] = ts;
+            emit LastDepositAtUpdated(msg.sender, ts);
+        }
 
         emit Deposited(msg.sender, amount);
     }
@@ -560,7 +607,12 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         // Use snapshot only: while locked, weights/tickets shouldn't change.
         uint256 t = d.tickets;
 
-        (address[3] memory winners, uint8 count) = _pickWinnersDistinct(seed, t);
+        uint64 cutoff = 0;
+        if (minHoldForEligibility != 0 && d.closedAt > minHoldForEligibility) {
+            cutoff = d.closedAt - minHoldForEligibility;
+        }
+
+        (address[3] memory winners, uint8 count) = _pickWinnersDistinct(seed, t, cutoff);
 
         d.winnersCount = count;
         d.winners = winners;
@@ -575,7 +627,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     /// @dev Pick up to 3 distinct winners WITHOUT storage writes (gas-optimized).
     /// Rejection sampling yields correct "without replacement" distribution when conditioning on uniqueness.
     /// Note: may return < 3 winners if maxTries is reached (to avoid pathological loops).
-    function _pickWinnersDistinct(bytes32 seed, uint256 tickets)
+    function _pickWinnersDistinct(bytes32 seed, uint256 tickets, uint64 cutoff)
         internal
         view
         returns (address[3] memory winners, uint8 count)
@@ -597,7 +649,18 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
                 uint256 idx = _fenwickFindByCumulative(r);
                 if (idx != 0 && idx < len) {
                     address w = _idxToUser[idx];
+                    if (noTickets[w]) { unchecked { ++a; } continue; }
+
                     if (w != address(0) && _weights[idx] != 0) {
+                        if (cutoff != 0) {
+                            uint64 ld = lastDepositAt[w];
+                            if (ld == 0 || ld > cutoff) {
+                                // deposit too recent (or unknown) => not eligible for this draw
+                                unchecked { ++a; }
+                                continue;
+                            }
+                        }
+
                         // distinct check (max 3)
                         if (count == 0 || (w != winners[0] && (count == 1 || w != winners[1]))) {
                             picked = w;
@@ -659,9 +722,9 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
     // ---------- Fenwick internals ----------
     function _syncWeight(address user) internal {
-        uint256 newW = balanceOf(user);
+        uint256 newW = noTickets[user] ? 0 : balanceOf(user);
         _setWeight(user, newW);
-    }
+    }  
 
     function _setWeight(address user, uint256 newW) internal {
         uint256 idx = indexOf[user];
@@ -874,8 +937,8 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
             // Phase INIT: set fenwick[i] = current balance of user at idx, and sync _weights[i]
             for (; i < end; ) {
-                address u = _idxToUser[i];
-                uint256 w = (u == address(0)) ? 0 : balanceOf(u);
+                address u = _idxToUser[i];                
+                uint256 w = (u == address(0)) ? 0 : (noTickets[u] ? 0 : balanceOf(u));
 
                 _weights[i] = w;
                 _fenwick[i] = w;
@@ -918,5 +981,24 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
                 emit FenwickRepairFinished(totalTickets());
             }
         }
+    }
+
+    function eligibleForDraw(address user, uint256 drawId) external view returns (bool) {
+        if (noTickets[user]) return false;
+
+        if (drawId == 0 || drawId > currentDrawId) return false;
+
+        DrawInfo storage d = draws[drawId];
+        if (d.closedAt == 0) return false;
+
+        if (balanceOf(user) == 0) return false;
+
+        if (minHoldForEligibility == 0) return true;
+
+        if (d.closedAt <= minHoldForEligibility) return true;
+
+        uint64 cutoff = d.closedAt - minHoldForEligibility;
+        uint64 ld = lastDepositAt[user];
+        return (ld != 0 && ld <= cutoff);
     }
 }
