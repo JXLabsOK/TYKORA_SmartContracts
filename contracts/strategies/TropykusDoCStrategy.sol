@@ -138,11 +138,14 @@ contract TropykusDoCStrategy is ReentrancyGuard {
         emit WithdrawAll(underlyingOut, to);
     }
 
+    //TYKO-05  -  2026 04 21
     function recoverERC20(address token, address to, uint256 amount) external onlyVault {
         if (to == address(0)) revert ZeroAddress();
-        if (token == address(underlying)) revert RecoverNotAllowed();
+        if (token == address(underlying) || token == address(kToken)) revert RecoverNotAllowed();
         if (amount == 0) revert ZeroAmount();
+
         IERC20(token).safeTransfer(to, amount);
         emit Recovered(token, amount, to);
     }
+    //TYKO-05  -  2026 04 21 END
 }

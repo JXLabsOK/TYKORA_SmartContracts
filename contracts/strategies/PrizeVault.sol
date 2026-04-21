@@ -9,7 +9,9 @@ import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.s
 
 import { IStrategy } from "../interfaces/IStrategy.sol";
 import { IRskBridge } from "../interfaces/IRskBridge.sol";
-
+//TYKO-05  -  2026 04 21
+import { IRecoverableStrategy } from "../interfaces/IRecoverableStrategy.sol";
+//TYKO-05  -  2026 04 21 END
 contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -31,8 +33,14 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     error EmergencyDelayNotPassed(uint256 nowTs, uint256 unlockTs);
     error BridgeNotSet();
     error EmergencyModeEnabled();
+    error EmergencyModeDisabled();//TYKO-02  -  2026 04 20
     error FenwickRepairInProgress();
-
+    //TYKO-01  -  2026 04 20
+    error InvalidMinHoldForEligibility();
+    //TYKO-01  -  2026 04 20 END
+    //TYKO-03  -  2026 04 21
+    error ManualAwardDisabled();
+    //TYKO-03  -  2026 04 21 END
     // ---------- events ----------
     event StrategySet(address indexed strategy);
     event Deposited(address indexed user, uint256 amountUnderlying);
@@ -164,6 +172,13 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         uint256[3] winnerPrizes;       // ordered amounts (sum == prize)
         address treasuryRecipient;     // snapshot treasury at close
     }
+    //TYKO-01  -  2026 04 20
+    /// @dev Ticket segment representation in the original cumulative ticket space.
+    struct Segment {
+        uint256 start;
+        uint256 len; // segment is [start, start + len)
+    }
+    //TYKO-01  -  2026 04 20 END
 
     uint256 public currentDrawId;
     uint64 public currentDrawStart;
@@ -184,14 +199,10 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         if (isLocked) revert VaultLocked();
         _;
     }
-
-    modifier whenNotEmergency() {
-        if (emergencyMode) revert EmergencyModeEnabled();
-        _;
-    }
         
     modifier whenNotRepairingOrEmergency() {
         if (fenwickRepairPhase != FenwickRepairPhase.NONE) revert FenwickRepairInProgress();
+        if (emergencyMode) revert EmergencyModeEnabled();//TYKO-02  -  2026 04 20
         _;
     }
 
@@ -211,6 +222,11 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     ) ERC20(_shareName, _shareSymbol) Ownable(_owner) {
         if (_underlying == address(0) || _owner == address(0) || _treasury == address(0)) revert ZeroAddress();
         if (_drawPeriodSeconds == 0) revert InvalidBps();
+        //TYKO-01  -  2026 04 20
+        if (_minHoldForEligibilitySeconds == 0 || _minHoldForEligibilitySeconds > _drawPeriodSeconds) {
+            revert InvalidMinHoldForEligibility();
+        }
+        //TYKO-01  -  2026 04 20 END
         if (uint256(_treasuryBps) + uint256(_keeperBps) > 10_000) revert InvalidBps();
         if (_emergencyDelaySeconds == 0) revert InvalidBps();
 
@@ -327,7 +343,6 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         onlyOwner
         whenNotRepairingOrEmergency
     {
-        if (emergencyMode) revert EmergencyModeEnabled();
         if (account == address(0)) revert ZeroAddress();
         if (isLocked) revert VaultLocked();
 
@@ -340,12 +355,11 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         if (enabled) {
             _setWeight(account, 0);
         } else {
-            // IMPORTANT: prevent cooldown bypass when re-enabling tickets
-            if (minHoldForEligibility != 0) {
-                uint64 ts = uint64(block.timestamp);
-                lastDepositAt[account] = ts;
-                emit LastDepositAtUpdated(account, ts);
-            }
+            //TYKO-01  -  2026 04 20
+            uint64 ts = uint64(block.timestamp);
+            lastDepositAt[account] = ts;
+            emit LastDepositAtUpdated(account, ts);
+            //TYKO-01  -  2026 04 20 END
             _syncWeight(account);
         }
 
@@ -353,7 +367,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     }
 
     // ---------- user flows ----------
-    function deposit(uint256 amount) external nonReentrant whenNotLocked whenNotEmergency whenNotRepairingOrEmergency {
+    function deposit(uint256 amount) external nonReentrant whenNotLocked whenNotRepairingOrEmergency{ //TYKO-02  -  2026 04 20
         if (amount == 0) revert ZeroAmount();
         if (address(strategy) == address(0)) revert StrategyNotSet();
 
@@ -365,7 +379,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         totalPrincipal += amount;
         _mint(msg.sender, amount);
 
-        if (minHoldForEligibility != 0 && !noTickets[msg.sender]) {
+        if (!noTickets[msg.sender]) {//TYKO-01  -  2026 04 20
             uint64 ts = uint64(block.timestamp);
             lastDepositAt[msg.sender] = ts;
             emit LastDepositAtUpdated(msg.sender, ts);
@@ -413,8 +427,8 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
     // ---------- DRAW: close -> award -> claim ----------
 
-    /// @notice Close current draw, compute yield + fees, and (if needed) lock vault until award+claim.
-    function closeDraw() external nonReentrant whenNotEmergency whenNotRepairingOrEmergency {
+    /// @notice Close current draw, compute yield + fees, and (if needed) lock vault until award+claim.    
+    function closeDraw() external nonReentrant whenNotRepairingOrEmergency { //TYKO-02  -  2026 04 20
         if (address(strategy) == address(0)) revert StrategyNotSet();
 
         uint256 endTs = drawEndTimestamp();
@@ -485,8 +499,8 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
         emit DrawClosed(drawId, d.startedAt, d.closedAt, btcTarget, y, prize, treasFee, keepTip, tickets, msg.sender);
     }
-
-    function awardDrawFromBtc(uint256 drawId) external nonReentrant whenNotEmergency whenNotRepairingOrEmergency {
+    
+    function awardDrawFromBtc(uint256 drawId) external nonReentrant whenNotRepairingOrEmergency{ //TYKO-02  -  2026 04 20
         if (drawId != currentDrawId) revert InvalidDraw();
 
         DrawInfo storage d = draws[drawId];
@@ -494,7 +508,10 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         if (d.status != DrawStatus.CLOSED) revert InvalidDrawState();
         if (!isLocked) revert InvalidDrawState();
 
-        // Bridge must be configured (tests can set bridge=0 and use awardDrawManual instead)
+        // TYKO-03
+        // Bridge must be configured.
+        // Tests/local deployments may set bridge=0 and use awardDrawManual.
+        // Production deployments should configure a real bridge and use awardDrawFromBtc.
         if (address(bridge) == address(0) || d.btcTargetHeight == 0) revert BridgeNotSet();
 
         bytes memory header = bridge.getBtcBlockchainBlockHeaderByHeight(d.btcTargetHeight);
@@ -514,8 +531,11 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
         emit DrawAwarded(drawId, seed, d.winnersCount, d.winners[0], d.winners[1], d.winners[2], msg.sender);
     }
-
-    function awardDrawManual(uint256 drawId, bytes32 seed) external onlyOwner nonReentrant whenNotEmergency whenNotRepairingOrEmergency {
+    
+    function awardDrawManual(uint256 drawId, bytes32 seed) external onlyOwner nonReentrant whenNotRepairingOrEmergency{ //TYKO-02  -  2026 04 20
+        // TYKO-03 -  2026 04 21        
+        if (address(bridge) != address(0)) revert ManualAwardDisabled();
+        // TYKO-03 -  2026 04 21 END
         if (drawId != currentDrawId) revert InvalidDraw();
         DrawInfo storage d = draws[drawId];
         if (d.status != DrawStatus.CLOSED) revert InvalidDrawState();
@@ -533,7 +553,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     }
 
     /// @notice Claim the draw: pays keeper tip to caller, treasury fee to treasury, and prizes to 1..3 winners (fallback to owed).
-    function claimDraw(uint256 drawId) external nonReentrant whenNotEmergency whenNotRepairingOrEmergency {
+    function claimDraw(uint256 drawId) external nonReentrant whenNotRepairingOrEmergency{ //TYKO-02  -  2026 04 20
         if (drawId != currentDrawId) revert InvalidDraw();
         DrawInfo storage d = draws[drawId];
         if (d.status != DrawStatus.AWARDED) revert InvalidDrawState();
@@ -553,8 +573,15 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         }
 
         if (keepTip > 0) underlying.safeTransfer(msg.sender, keepTip);
+        //TYKO-08  -  2026 04 21
         address treas = d.treasuryRecipient;
-        if (treasFee > 0) underlying.safeTransfer(treas, treasFee);
+        if (treasFee > 0) {
+            if (!_tryTransferERC20(address(underlying), treas, treasFee)) {
+                prizeOwed[treas] += treasFee;
+                emit PrizeOwed(treas, treasFee);
+            }
+        }
+        //TYKO-08  -  2026 04 21 END
 
         uint8 wc = d.winnersCount;
         for (uint8 i = 0; i < wc; i++) {
@@ -606,11 +633,10 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     function _awardWithSeed(DrawInfo storage d, bytes32 seed) internal {
         // Use snapshot only: while locked, weights/tickets shouldn't change.
         uint256 t = d.tickets;
-
-        uint64 cutoff = 0;
-        if (minHoldForEligibility != 0 && d.closedAt > minHoldForEligibility) {
-            cutoff = d.closedAt - minHoldForEligibility;
-        }
+        //TYKO-01  -  2026 04 20
+        uint64 scheduledEnd = d.startedAt + drawPeriod;
+        uint64 cutoff = scheduledEnd - minHoldForEligibility;
+        //TYKO-01  -  2026 04 20 END
 
         (address[3] memory winners, uint8 count) = _pickWinnersDistinct(seed, t, cutoff);
 
@@ -624,65 +650,194 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         d.winnerPrizes = _splitPrize503020(d.prize, count);
     }
 
-    /// @dev Pick up to 3 distinct winners WITHOUT storage writes (gas-optimized).
-    /// Rejection sampling yields correct "without replacement" distribution when conditioning on uniqueness.
-    /// Note: may return < 3 winners if maxTries is reached (to avoid pathological loops).
-    function _pickWinnersDistinct(bytes32 seed, uint256 tickets, uint64 cutoff)
-        internal
-        view
-        returns (address[3] memory winners, uint8 count)
-    {
+    //TYKO-01  -  2026 04 20
+    /// @dev Pick exactly up to 3 distinct eligible winners without rebuilding the Fenwick tree.
+    /// Segment-exclusion sampling:
+    /// - When an ineligible/invalid/duplicate address is hit, we exclude its entire ticket segment
+    ///   [prefix(idx-1), prefix(idx)) from the sampling space.
+    /// - We then sample uniformly over the remaining space and map back to the original space.
+    ///
+    /// Note: this function will return < 3 winners only if it cannot find enough eligible distinct
+    /// winners within the attempt bounds (or if fewer than 3 eligible holders exist in practice).
+    function _pickWinnersDistinct(
+        bytes32 seed,
+        uint256 tickets,
+        uint64 cutoff        
+    ) internal view returns (address[3] memory winners, uint8 count) {
         if (tickets == 0) return (winners, 0);
 
         uint256 len = _idxToUser.length;
         if (len <= 1) return (winners, 0); // only dummy slot
 
-        // Tradeoff: higher => more likely to find 2nd/3rd winner under whale dominance, but more gas.
-        uint8 maxTries = 64;
+        // Excluded ticket segments in the original ticket space [0, tickets).
+        // IMPORTANT: this must be an actual memory array, not just the struct name.
+        uint256 maxExcluded = 64; // increase if you expect many exclusions in a single draw
+        Segment[] memory excluded = new Segment[](maxExcluded);
+        uint256 excludedCount = 0;
+
+        uint256 remaining = tickets;
 
         for (uint8 i = 0; i < NUM_WINNERS; ) {
-            address picked = address(0);
+            if (remaining == 0) break;
 
-            for (uint8 a = 0; a < maxTries; ) {
-                uint256 r = uint256(keccak256(abi.encodePacked(seed, i, a))) % tickets;
+            // Try until we find a valid winner for this slot.
+            for (uint16 a = 0; a < 1024; ) {
+                // Sample uniformly over the remaining (non-excluded) ticket space.
+                uint256 y = uint256(keccak256(abi.encodePacked(seed, i, a))) % remaining;
 
-                uint256 idx = _fenwickFindByCumulative(r);
-                if (idx != 0 && idx < len) {
-                    address w = _idxToUser[idx];
-                    if (noTickets[w]) { unchecked { ++a; } continue; }
+                // Map y into the original ticket space [0, tickets) by skipping excluded segments.
+                uint256 x = _mapToOriginal(y, excluded, excludedCount);
 
-                    if (w != address(0) && _weights[idx] != 0) {
-                        if (cutoff != 0) {
-                            uint64 ld = lastDepositAt[w];
-                            if (ld == 0 || ld > cutoff) {
-                                // deposit too recent (or unknown) => not eligible for this draw
-                                unchecked { ++a; }
-                                continue;
-                            }
+                uint256 idx = _fenwickFindByCumulative(x);
+                if (idx == 0 || idx >= len) {
+                    unchecked { ++a; }
+                    continue;
+                }
+
+                address w = _idxToUser[idx];
+                uint256 wgt = _weights[idx];
+
+                // Safety checks (should not happen in a consistent Fenwick tree, but keep as guardrails).
+                if (w == address(0) || wgt == 0) {
+                    unchecked { ++a; }
+                    continue;
+                }
+
+                // Cooldown + sponsor eligibility check
+                if (!_isEligibleWinner(w, cutoff)) {
+                    (uint256 segStart, uint256 segLen) = _segmentForIndex(idx, wgt);
+
+                    uint256 prevCount = excludedCount;
+                    excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart, segLen);
+
+                    // Only shrink remaining if we successfully inserted (buffer not full / not duplicate).
+                    if (excludedCount != prevCount) {
+                        remaining -= segLen;
+                    }
+
+                    unchecked { ++a; }
+                    continue;
+                }
+
+                // Distinct check (also exclude duplicates to avoid re-hitting them).
+                if (count != 0) {
+                    if (w == winners[0] || (count > 1 && w == winners[1])) {
+                        (uint256 segStart2, uint256 segLen2) = _segmentForIndex(idx, wgt);
+
+                        uint256 prevCount2 = excludedCount;
+                        excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart2, segLen2);
+
+                        if (excludedCount != prevCount2) {
+                            remaining -= segLen2;
                         }
 
-                        // distinct check (max 3)
-                        if (count == 0 || (w != winners[0] && (count == 1 || w != winners[1]))) {
-                            picked = w;
-                            break;
-                        }
+                        unchecked { ++a; }
+                        continue;
                     }
                 }
 
-                unchecked { ++a; }
+                // Valid distinct winner found.
+                winners[count] = w;
+                unchecked { ++count; }
+
+                // Exclude winner segment to enforce sampling without replacement.
+                (uint256 segStart3, uint256 segLen3) = _segmentForIndex(idx, wgt);
+
+                uint256 prevCount3 = excludedCount;
+                excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart3, segLen3);
+
+                if (excludedCount != prevCount3) {
+                    remaining -= segLen3;
+                }
+
+                // Move to next winner slot.
+                break;
             }
 
-            if (picked == address(0)) break;
+            // If we failed to fill this winner slot, stop.
+            if (count < i + 1) break;
 
-            winners[count] = picked;
-            unchecked {
-                ++count;
-                ++i;
-            }
+            unchecked { ++i; }
         }
 
         return (winners, count);
+    }    
+
+    /// @dev Compute the ticket segment for a given Fenwick index.
+    /// @param idx Fenwick/user index.
+    /// @param wgt The weight at idx (_weights[idx]) to avoid a redundant SLOAD.
+    function _segmentForIndex(uint256 idx, uint256 wgt) internal view returns (uint256 start, uint256 segLen) {
+        // prefix(idx-1) gives the segment start.
+        start = _fenwickSum(idx - 1);
+        segLen = wgt; // weights map 1:1 to ticket-length in cumulative space
     }
+
+    /// @dev Map a uniform y in [0, remaining) to x in [0, total) by skipping excluded segments.
+    /// Excluded segments must be sorted by start ascending and non-overlapping.
+    function _mapToOriginal(
+        uint256 y,
+        Segment[] memory excluded,
+        uint256 excludedCount
+    ) internal pure returns (uint256 x) {
+        x = y;
+
+        for (uint256 j = 0; j < excludedCount; ) {
+            if (x >= excluded[j].start) {
+                x += excluded[j].len;
+                unchecked { ++j; }
+            } else {
+                break;
+            }
+        }
+
+        return x;
+    }
+
+    /// @dev Insert a segment into the excluded list while keeping it sorted by start.
+    /// If the buffer is full or the segment is already present, it will be ignored.
+    function _insertSegmentSorted(
+        Segment[] memory excluded,
+        uint256 excludedCount,
+        uint256 start,
+        uint256 segLen
+    ) internal pure returns (uint256 newCount) {
+        if (segLen == 0) return excludedCount;
+        if (excludedCount >= excluded.length) return excludedCount;
+
+        // Avoid inserting duplicates (same start => same user segment).
+        for (uint256 k = 0; k < excludedCount; ) {
+            if (excluded[k].start == start) return excludedCount;
+            unchecked { ++k; }
+        }
+
+        Segment memory s = Segment({ start: start, len: segLen });
+
+        // Insertion sort (small N expected).
+        uint256 i = excludedCount;
+        while (i > 0) {
+            Segment memory prev = excluded[i - 1];
+            if (prev.start <= s.start) break;
+            excluded[i] = prev;
+            unchecked { --i; }
+        }
+        excluded[i] = s;
+
+        return excludedCount + 1;
+    }
+
+    /// @dev Eligibility rules:
+    /// - noTickets => always ineligible
+    /// - must have non-zero shares at award time (note: this reflects *current* shares; no per-user snapshot)
+    function _isEligibleWinner(address w, uint64 cutoff) internal view returns (bool) {
+        if (noTickets[w]) return false;
+        if (balanceOf(w) == 0) return false;
+
+        uint64 ld = lastDepositAt[w];
+        if (ld == 0) return false;
+
+        return ld <= cutoff;
+    }
+    //TYKO-01  -  2026 04 20 END
 
     /// @dev Split prize with 50/30/20 when 3 winners.
     /// If 2 winners: renormalize 50:30 => 5/8 and 3/8.
@@ -852,6 +1007,11 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
     // ---------- ERC20 try-transfer (non-reverting) ----------
     function _tryTransferERC20(address token, address to, uint256 amount) internal returns (bool ok) {
+        //TYKO-07  -  2026 04 21
+        // Consistent with OpenZeppelin SafeERC20 behavior:
+        // if target has no code, treat as failed transfer.
+        if (token.code.length == 0) return false;
+
         (bool success, bytes memory data) =
             token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, amount));
 
@@ -859,6 +1019,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         if (data.length == 0) return true;
         if (data.length == 32) return abi.decode(data, (bool));
         return false;
+        //TYKO-07  -  2026 04 21 END
     }
 
     function _bestBtcHeight() internal view returns (uint256) {
@@ -870,8 +1031,13 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     function _doubleSha256(bytes memory b) internal pure returns (bytes32) {
         return sha256(abi.encodePacked(sha256(b)));
     }
+    
+    function emergencyCancelDraw(uint256 drawId) external onlyOwner nonReentrant {
+        //TYKO-02  -  2026 04 20
+        if (fenwickRepairPhase != FenwickRepairPhase.NONE) revert FenwickRepairInProgress();
+        if (!emergencyMode) revert EmergencyModeDisabled();
+        //TYKO-02  -  2026 04 20 END
 
-    function emergencyCancelDraw(uint256 drawId) external onlyOwner nonReentrant whenNotRepairingOrEmergency {
         if (drawId != currentDrawId) revert InvalidDraw();
         DrawInfo storage d = draws[drawId];
 
@@ -985,20 +1151,33 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
 
     function eligibleForDraw(address user, uint256 drawId) external view returns (bool) {
         if (noTickets[user]) return false;
-
         if (drawId == 0 || drawId > currentDrawId) return false;
 
         DrawInfo storage d = draws[drawId];
-        if (d.closedAt == 0) return false;
+        if (d.startedAt == 0) return false;//TYKO-01  -  2026 04 20
 
         if (balanceOf(user) == 0) return false;
 
-        if (minHoldForEligibility == 0) return true;
+        //TYKO-01  -  2026 04 20
+        uint64 scheduledEnd = d.startedAt + drawPeriod;
+        uint64 cutoff = scheduledEnd - minHoldForEligibility;
+        //TYKO-01  -  2026 04 20 END
 
-        if (d.closedAt <= minHoldForEligibility) return true;
-
-        uint64 cutoff = d.closedAt - minHoldForEligibility;
         uint64 ld = lastDepositAt[user];
-        return (ld != 0 && ld <= cutoff);
+        //TYKO-01  -  2026 04 20
+        if (ld == 0) return false;
+
+        return ld <= cutoff;
+        //TYKO-01  -  2026 04 20 END
     }
+
+    //TYKO-05  -  2026 04 21
+    function recoverStrategyERC20(address token, address to, uint256 amount) external onlyOwner {
+        if (address(strategy) == address(0)) revert StrategyNotSet();
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
+        IRecoverableStrategy(address(strategy)).recoverERC20(token, to, amount);
+    }
+    //TYKO-05  -  2026 04 21
 }

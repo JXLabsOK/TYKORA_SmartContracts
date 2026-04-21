@@ -8,6 +8,15 @@ const CLOSED = 1;
 const AWARDED = 2;
 const CLAIMED = 3;
 
+const DAY = 24n * 60n * 60n;
+const TEST_DRAW_PERIOD = 7n * DAY; // 7 days
+const TEST_MIN_HOLD = 5n * DAY; // 5 days
+const TEST_CUTOFF_OFFSET = TEST_DRAW_PERIOD - TEST_MIN_HOLD; // 2 days
+const TEST_TREASURY_BPS = 900;
+const TEST_KEEPER_BPS = 100;
+const TEST_BTC_CONFIRMATIONS = 6;
+const TEST_EMERGENCY_DELAY = 12 * 60 * 60; // 12 hours
+
 function bn(v: string) {
   return ethers.parseUnits(v, 18);
 }
@@ -42,12 +51,30 @@ function expectedSplit503020(prize: bigint, winnersCount: number): bigint[] {
   exp[2] = p3;
   return exp;
 }
-
-async function advanceToEndAndMature(vault: any) {
+//TYKO-01  -  2026 04 20
+async function advanceToDrawEnd(vault: any) {
   const end = await vault.drawEndTimestamp();
-  const hold = await vault.minHoldForEligibility(); // bigint
-  await time.increaseTo(end + 1n + hold);
+  await time.increaseTo(end + 1n);
 }
+
+// I'm keeping this name to avoid breaking existing tests.
+// With the new logic, you no longer need to wait for `+hold` to close the draw.
+async function advanceToEndAndMature(vault: any) {
+  await advanceToDrawEnd(vault);
+}
+
+async function advancePastCutoff(vault: any) {
+  const drawId = await vault.currentDrawId();
+  const d = await vault.draws(drawId);
+  const cutoff = BigInt(d.startedAt) + TEST_CUTOFF_OFFSET;
+  await time.increaseTo(cutoff + 1n);
+}
+
+async function advanceWellPastDrawEnd(vault: any, extraSeconds: bigint = 0n) {
+  const end = await vault.drawEndTimestamp();
+  await time.increaseTo(end + 1n + extraSeconds);
+}
+//TYKO-01  -  2026 04 20 END
 
 describe("PrizeVault", function () {
   async function fixture() {
@@ -67,12 +94,6 @@ describe("PrizeVault", function () {
 
     // --- Deploy vault (strategy NOT set yet) ---
     const PrizeVault = await ethers.getContractFactory("PrizeVault");
-    const drawPeriod = 100; // seconds
-    const treasuryBps = 900; // 9%
-    const keeperBps = 100; // 1%
-    const btcConfirmations = 6;
-    const emergencyDelay = 200; // seconds
-    const minHoldForEligibilitySeconds = 24 * 60 * 60; // minHoldForEligibilitySeconds (24hs)
 
     const vault = await PrizeVault.deploy(
       await doc.getAddress(),
@@ -80,12 +101,12 @@ describe("PrizeVault", function () {
       "tDOC",
       owner.address,
       treasury.address,
-      drawPeriod,
-      minHoldForEligibilitySeconds,
-      treasuryBps,
-      keeperBps,
-      btcConfirmations,
-      emergencyDelay,
+      TEST_DRAW_PERIOD,
+      TEST_MIN_HOLD,
+      TEST_TREASURY_BPS,
+      TEST_KEEPER_BPS,
+      TEST_BTC_CONFIRMATIONS,
+      TEST_EMERGENCY_DELAY,
       ethers.ZeroAddress // bridge=0 => manual award mode in tests
     );
     await vault.waitForDeployment();
@@ -109,14 +130,175 @@ describe("PrizeVault", function () {
       doc,
       strategy,
       vault,
-      drawPeriod,
-      treasuryBps,
-      keeperBps,
-      emergencyDelay,
+      drawPeriod: TEST_DRAW_PERIOD,
+      treasuryBps: TEST_TREASURY_BPS,
+      keeperBps: TEST_KEEPER_BPS,
+      emergencyDelay: TEST_EMERGENCY_DELAY,
+      minHoldForEligibilitySeconds: TEST_MIN_HOLD,
     };
   }
+  //TYKO-01  -  2026 04 20
+  describe("TYKO-01 cooldown / JIT protection", function () {
+    it("deposit before cutoff is eligible for current draw", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
 
-  describe("constructor", function () {
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(true);
+    });
+
+    it("deposit exactly at cutoff is eligible for current draw", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      const drawId = await vault.currentDrawId();
+      const d = await vault.draws(drawId);
+      const cutoff = BigInt(d.startedAt) + TEST_CUTOFF_OFFSET;
+
+      // approve before
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+
+      // IMPORTANT: el bloque del deposit debe minarse exactamente en cutoff
+      await time.setNextBlockTimestamp(cutoff);
+      await vault.connect(alice).deposit(bn("100"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(true);
+    });
+
+    it("deposit after cutoff is NOT eligible for current draw", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await advancePastCutoff(vault);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(false);
+    });
+
+    it("deposit after scheduled end but before closeDraw is NOT eligible", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await advanceWellPastDrawEnd(vault);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(false);
+    });
+
+    it("late closeDraw does not make late deposit eligible", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await advanceWellPastDrawEnd(vault);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await time.increase(3n * DAY);
+
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(false);
+    });
+
+    it("3 sybil addresses depositing after draw end cannot win any slot", async () => {
+      const signers = await ethers.getSigners();
+      const { vault, strategy, owner, keeper, alice, bob, carol, doc } =
+        await loadFixture(fixture);
+
+      const eve1 = signers[7];
+      const eve2 = signers[8];
+      const eve3 = signers[9];
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      const vaultAddr = await vault.getAddress();
+
+      for (const u of [alice, bob, carol]) {
+        await doc.connect(u).approve(vaultAddr, bn("1000"));
+        await vault.connect(u).deposit(bn("1000"));
+      }
+
+      // Generate yield for the draw
+      await doc.mint(await strategy.getAddress(), bn("300"));
+
+      // Eve deposits AFTER scheduled draw end, BEFORE closeDraw()
+      await advanceWellPastDrawEnd(vault);
+
+      for (const e of [eve1, eve2, eve3]) {
+        await doc.mint(e.address, bn("3000"));
+        await doc.connect(e).approve(vaultAddr, bn("3000"));
+        await vault.connect(e).deposit(bn("3000"));
+      }
+
+      await vault.connect(keeper).closeDraw();
+
+      const seed = ethers.id("tyko-01-sybil-mitigated");
+      await vault.connect(owner).awardDrawManual(1n, seed);
+
+      const [wc, winnersFixed] = await vault.getWinners(1n);
+      const winnersCount = Number(wc);
+      const winnersArr = (winnersFixed as unknown as string[])
+        .slice(0, winnersCount)
+        .map((x) => x.toLowerCase());
+
+      const eveSet = new Set([
+        eve1.address.toLowerCase(),
+        eve2.address.toLowerCase(),
+        eve3.address.toLowerCase(),
+      ]);
+
+      expect(winnersArr.length).to.be.greaterThan(0);
+
+      for (const w of winnersArr) {
+        expect(eveSet.has(w)).to.eq(false, `sybil address ${w} should not be eligible`);
+      }
+    });
+
+    it("re-enabling noTickets resets lastDepositAt and makes user wait for next draw", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await advancePastCutoff(vault);
+
+      await vault.connect(owner).setNoTickets(alice.address, true);
+      await vault.connect(owner).setNoTickets(alice.address, false);
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      expect(await vault.eligibleForDraw(alice.address, 1n)).to.eq(false);
+    });
+  });
+  //TYKO-01  -  2026 04 20
+
+    describe("constructor", function () {
     it("reverts on zero addresses / invalid params", async () => {
       const { owner, treasury, doc } = await loadFixture(fixture);
       const PrizeVault = await ethers.getContractFactory("PrizeVault");
@@ -129,17 +311,17 @@ describe("PrizeVault", function () {
           "s",
           owner.address,
           treasury.address,
-          100,
-          24 * 60 * 60,
-          900,
-          100,
-          6,
-          200,
+          TEST_DRAW_PERIOD,
+          TEST_MIN_HOLD,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
           ethers.ZeroAddress
         )
       ).to.be.revertedWithCustomError(PrizeVault, "ZeroAddress");
 
-      // owner = 0 => OZ OwnableInvalidOwner(0x0) (reverts before our ZeroAddress check)
+      // owner = 0 => OZ OwnableInvalidOwner(0x0)
       await expect(
         PrizeVault.deploy(
           await doc.getAddress(),
@@ -147,12 +329,12 @@ describe("PrizeVault", function () {
           "s",
           ethers.ZeroAddress,
           treasury.address,
-          100,
-          24 * 60 * 60,
-          900,
-          100,
-          6,
-          200,
+          TEST_DRAW_PERIOD,
+          TEST_MIN_HOLD,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
           ethers.ZeroAddress
         )
       )
@@ -167,12 +349,12 @@ describe("PrizeVault", function () {
           "s",
           owner.address,
           ethers.ZeroAddress,
-          100,
-          24 * 60 * 60,
-          900,
-          100,
-          6,
-          200,
+          TEST_DRAW_PERIOD,
+          TEST_MIN_HOLD,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
           ethers.ZeroAddress
         )
       ).to.be.revertedWithCustomError(PrizeVault, "ZeroAddress");
@@ -186,11 +368,11 @@ describe("PrizeVault", function () {
           owner.address,
           treasury.address,
           0,
-          24 * 60 * 60,
-          900,
-          100,
-          6,
-          200,
+          1,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
           ethers.ZeroAddress
         )
       ).to.be.revertedWithCustomError(PrizeVault, "InvalidBps");
@@ -203,12 +385,12 @@ describe("PrizeVault", function () {
           "s",
           owner.address,
           treasury.address,
-          100,
-          24 * 60 * 60,
+          TEST_DRAW_PERIOD,
+          TEST_MIN_HOLD,
           9000,
           2000,
-          6,
-          200,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
           ethers.ZeroAddress
         )
       ).to.be.revertedWithCustomError(PrizeVault, "InvalidBps");
@@ -221,16 +403,61 @@ describe("PrizeVault", function () {
           "s",
           owner.address,
           treasury.address,
-          100,
-          24 * 60 * 60,
-          900,
-          100,
-          6,
+          TEST_DRAW_PERIOD,
+          TEST_MIN_HOLD,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
           0,
           ethers.ZeroAddress
         )
       ).to.be.revertedWithCustomError(PrizeVault, "InvalidBps");
     });
+    //TYKO-01  -  2026 04 20
+    it("reverts if minHoldForEligibilitySeconds == 0", async () => {
+      const { owner, treasury, doc } = await loadFixture(fixture);
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+
+      await expect(
+        PrizeVault.deploy(
+          await doc.getAddress(),
+          "Share",
+          "s",
+          owner.address,
+          treasury.address,
+          TEST_DRAW_PERIOD,
+          0,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
+          ethers.ZeroAddress
+        )
+      ).to.be.revertedWithCustomError(PrizeVault, "InvalidMinHoldForEligibility");
+    });
+
+    it("reverts if minHoldForEligibilitySeconds > drawPeriod", async () => {
+      const { owner, treasury, doc } = await loadFixture(fixture);
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+
+      await expect(
+        PrizeVault.deploy(
+          await doc.getAddress(),
+          "Share",
+          "s",
+          owner.address,
+          treasury.address,
+          TEST_DRAW_PERIOD,
+          TEST_DRAW_PERIOD + 1n,
+          TEST_TREASURY_BPS,
+          TEST_KEEPER_BPS,
+          TEST_BTC_CONFIRMATIONS,
+          TEST_EMERGENCY_DELAY,
+          ethers.ZeroAddress
+        )
+      ).to.be.revertedWithCustomError(PrizeVault, "InvalidMinHoldForEligibility");
+    });
+    //TYKO-01  -  2026 04 20 END
 
     it("initializes draw #1 as OPEN", async () => {
       const { vault } = await loadFixture(fixture);
@@ -311,6 +538,190 @@ describe("PrizeVault", function () {
       expect(allowance).to.eq(ethers.MaxUint256);
     });
   });
+
+  //TYKO-05  -  2026 04 21
+  describe("TYKO-05 strategy token recovery", function () {
+    it("recoverStrategyERC20: onlyOwner", async () => {
+      const { vault, strategy, owner, other } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await expect(
+        vault.connect(other).recoverStrategyERC20(
+          ethers.ZeroAddress,
+          other.address,
+          1n
+        )
+      )
+        .to.be.revertedWithCustomError(vault, "OwnableUnauthorizedAccount")
+        .withArgs(other.address);
+    });
+
+    it("recoverStrategyERC20: reverts if strategy is not set", async () => {
+      const { vault, owner, other } = await loadFixture(fixture);
+
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          ethers.ZeroAddress,
+          other.address,
+          1n
+        )
+      ).to.be.revertedWithCustomError(vault, "StrategyNotSet");
+    });
+
+    it("recoverStrategyERC20: reverts on zero address and zero amount", async () => {
+      const { vault, strategy, owner, other } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          ethers.ZeroAddress,
+          ethers.ZeroAddress,
+          1n
+        )
+      ).to.be.revertedWithCustomError(vault, "ZeroAddress");
+
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          ethers.ZeroAddress,
+          other.address,
+          0n
+        )
+      ).to.be.revertedWithCustomError(vault, "ZeroAmount");
+    });
+
+    it("recoverStrategyERC20: recovers arbitrary ERC20 accidentally sent to strategy", async () => {
+      const [owner, treasury, keeper, alice, bob, carol, other] = await ethers.getSigners();
+
+      const MockERC20 = await ethers.getContractFactory("MockERC20");
+      const doc = await MockERC20.deploy("Mock DOC", "DOC", 18);
+      await doc.waitForDeployment();
+
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+      const vault = await PrizeVault.deploy(
+        await doc.getAddress(),
+        "TYKORA Share",
+        "tDOC",
+        owner.address,
+        treasury.address,
+        TEST_DRAW_PERIOD,
+        TEST_MIN_HOLD,
+        TEST_TREASURY_BPS,
+        TEST_KEEPER_BPS,
+        TEST_BTC_CONFIRMATIONS,
+        TEST_EMERGENCY_DELAY,
+        ethers.ZeroAddress
+      );
+      await vault.waitForDeployment();
+
+      const MockKToken = await ethers.getContractFactory("MockKToken");
+      const kToken = await MockKToken.deploy(
+        await doc.getAddress(),
+        "kDOC",
+        "kDOC",
+        18,
+        ethers.parseUnits("1", 18)
+      );
+      await kToken.waitForDeployment();
+
+      const TropykusDoCStrategy = await ethers.getContractFactory("TropykusDoCStrategy");
+      const realStrategy = await TropykusDoCStrategy.deploy(
+        await vault.getAddress(),
+        await doc.getAddress(),
+        await kToken.getAddress()
+      );
+      await realStrategy.waitForDeployment();
+
+      await vault.connect(owner).setStrategy(await realStrategy.getAddress());
+
+      const stray = await MockERC20.deploy("Stray", "STRAY", 18);
+      await stray.waitForDeployment();
+
+      await stray.mint(other.address, bn("500"));
+      await stray.connect(other).transfer(await realStrategy.getAddress(), bn("50"));
+
+      expect(await stray.balanceOf(await realStrategy.getAddress())).to.eq(bn("50"));
+      expect(await stray.balanceOf(other.address)).to.eq(bn("450"));
+
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          await stray.getAddress(),
+          other.address,
+          bn("50")
+        )
+      )
+        .to.emit(realStrategy, "Recovered")
+        .withArgs(await stray.getAddress(), bn("50"), other.address);
+
+      expect(await stray.balanceOf(await realStrategy.getAddress())).to.eq(0n);
+      expect(await stray.balanceOf(other.address)).to.eq(bn("500"));
+    });
+
+    it("recoverStrategyERC20: reverts for underlying and kToken", async () => {
+      const [owner, treasury, keeper, alice, bob, carol, other] = await ethers.getSigners();
+
+      const MockERC20 = await ethers.getContractFactory("MockERC20");
+      const doc = await MockERC20.deploy("Mock DOC", "DOC", 18);
+      await doc.waitForDeployment();
+
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+      const vault = await PrizeVault.deploy(
+        await doc.getAddress(),
+        "TYKORA Share",
+        "tDOC",
+        owner.address,
+        treasury.address,
+        TEST_DRAW_PERIOD,
+        TEST_MIN_HOLD,
+        TEST_TREASURY_BPS,
+        TEST_KEEPER_BPS,
+        TEST_BTC_CONFIRMATIONS,
+        TEST_EMERGENCY_DELAY,
+        ethers.ZeroAddress
+      );
+      await vault.waitForDeployment();
+
+      const MockKToken = await ethers.getContractFactory("MockKToken");
+      const kToken = await MockKToken.deploy(
+        await doc.getAddress(),
+        "kDOC",
+        "kDOC",
+        18,
+        ethers.parseUnits("1", 18)
+      );
+      await kToken.waitForDeployment();
+
+      const TropykusDoCStrategy = await ethers.getContractFactory("TropykusDoCStrategy");
+      const realStrategy = await TropykusDoCStrategy.deploy(
+        await vault.getAddress(),
+        await doc.getAddress(),
+        await kToken.getAddress()
+      );
+      await realStrategy.waitForDeployment();
+
+      await vault.connect(owner).setStrategy(await realStrategy.getAddress());
+
+      // underlying must be blocked
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          await doc.getAddress(),
+          other.address,
+          bn("1")
+        )
+      ).to.be.revertedWithCustomError(realStrategy, "RecoverNotAllowed");
+
+      // kToken must also be blocked
+      await expect(
+        vault.connect(owner).recoverStrategyERC20(
+          await kToken.getAddress(),
+          other.address,
+          bn("1")
+        )
+      ).to.be.revertedWithCustomError(realStrategy, "RecoverNotAllowed");
+    });
+  });
+  //TYKO-05  -  2026 04 21 END
 
   describe("deposits/withdrawals + non-transferable shares", function () {
     it("deposit: reverts if StrategyNotSet / ZeroAmount / VaultLocked", async () => {
@@ -764,7 +1175,7 @@ describe("PrizeVault", function () {
         .to.be.revertedWithCustomError(vault, "BridgeNotSet");
     });
 
-    it("option A: whale dominance can return winnersCount < 3 (deterministic seed search)", async () => {
+    it("option A: whale dominance still yields 3 distinct winners with segment exclusion sampling", async () => {
       const { vault, strategy, owner, alice, bob, carol, doc } = await loadFixture(fixture);
 
       await vault.connect(owner).setStrategy(await strategy.getAddress());
@@ -774,7 +1185,7 @@ describe("PrizeVault", function () {
       const whale = bn("1000000");
       const minnow = bn("1");
 
-      // Whale first => index 1
+      // Alice whale, Bob y Carol minnows
       await doc.connect(alice).approve(vaultAddr, whale);
       await vault.connect(alice).deposit(whale);
 
@@ -786,59 +1197,142 @@ describe("PrizeVault", function () {
 
       await doc.mint(await strategy.getAddress(), bn("10"));
 
-      await advanceToEndAndMature(vault);
+      await advanceToDrawEnd(vault);//TYKO-01  -  2026 04 20
 
       await vault.connect(owner).closeDraw();
       expect(await vault.isLocked()).to.eq(true);
 
-      const tickets = await vault.totalTickets();
-      expect(tickets).to.eq(whale + minnow + minnow);
-
-      let foundSeed: string | null = null;
-
-      const maxTries = 64; // must match contract
-      const maxSeedsToTry = 200;
-
-      for (let k = 0; k < maxSeedsToTry; k++) {
-        const seed = ethers.id("whale-seed-" + k);
-
-        const h0 = ethers.solidityPackedKeccak256(["bytes32", "uint8", "uint8"], [seed, 0, 0]);
-        const r0 = BigInt(h0) % tickets;
-        if (r0 >= whale) continue;
-
-        let ok = true;
-
-        for (let i = 1; i <= 2 && ok; i++) {
-          for (let a = 0; a < maxTries; a++) {
-            const h = ethers.solidityPackedKeccak256(["bytes32", "uint8", "uint8"], [seed, i, a]);
-            const r = BigInt(h) % tickets;
-            if (r >= whale) {
-              ok = false;
-              break;
-            }
-          }
-        }
-
-        if (ok) {
-          foundSeed = seed;
-          break;
-        }
-      }
-
-      expect(foundSeed).to.not.eq(null);
-
-      await vault.connect(owner).awardDrawManual(1n, foundSeed!);
+      const seed = ethers.id("whale-segment-exclusion-seed");//TYKO-01  -  2026 04 20
+      await vault.connect(owner).awardDrawManual(1n, seed);
 
       const [wc, winnersFixed] = await vault.getWinners(1n);
       const winnersCount = Number(wc);
-      const winnersArr = winnersFixed as unknown as [string, string, string];
+      //TYKO-01  -  2026 04 20
+      const winnersArr = (winnersFixed as unknown as string[])
+        .slice(0, winnersCount)
+        .map((w) => w.toLowerCase());
 
-      expect(winnersCount).to.eq(1);
-      expect(winnersArr[0].toLowerCase()).to.eq(alice.address.toLowerCase());
+      expect(winnersCount).to.eq(3);
+      expect(uniq(winnersArr).length).to.eq(3);
+
+      expect(winnersArr).to.include(alice.address.toLowerCase());
+      expect(winnersArr).to.include(bob.address.toLowerCase());
+      expect(winnersArr).to.include(carol.address.toLowerCase());
+      //TYKO-01  -  2026 04 20 END
     });
   });
 
+  //TYKO-08  -  2026 04 21
+  describe("TYKO-08 treasury transfer fallback", function () {
+    it("claimDraw: failing treasury transfer falls back to prizeOwed and does not lock the vault", async () => {
+      const [owner, treasury, keeper, alice] = await ethers.getSigners();
+
+      const MockBlacklistERC20 = await ethers.getContractFactory("MockBlacklistERC20");
+      const token = await MockBlacklistERC20.deploy("Mock DOC", "DOC");
+      await token.waitForDeployment();
+
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+      const vault = await PrizeVault.deploy(
+        await token.getAddress(),
+        "TYKORA Share",
+        "tDOC",
+        owner.address,
+        treasury.address,
+        TEST_DRAW_PERIOD,
+        TEST_MIN_HOLD,
+        TEST_TREASURY_BPS,
+        TEST_KEEPER_BPS,
+        TEST_BTC_CONFIRMATIONS,
+        TEST_EMERGENCY_DELAY,
+        ethers.ZeroAddress
+      );
+      await vault.waitForDeployment();
+
+      const MockStrategy = await ethers.getContractFactory("MockStrategy");
+      const strategy = await MockStrategy.deploy(
+        await vault.getAddress(),
+        await token.getAddress()
+      );
+      await strategy.waitForDeployment();
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // one participant
+      await token.mint(alice.address, bn("1000"));
+      await token.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      // generate yield in strategy
+      await token.mint(await strategy.getAddress(), bn("10"));
+
+      const end = await vault.drawEndTimestamp();
+      await time.increaseTo(end + 1n);
+
+      await vault.connect(owner).closeDraw();
+
+      const dClosed = await vault.draws(1n);
+      const treasFee = dClosed.treasuryFee;
+      const prize = dClosed.prize;
+
+      expect(treasFee).to.be.gt(0n);
+      expect(prize).to.be.gt(0n);
+
+      // blacklist treasury so transfer to treasury fails during claimDraw
+      await token.setBlocked(treasury.address, true);
+
+      const seed = ethers.id("tyko-08-treasury-fallback");
+      await vault.connect(owner).awardDrawManual(1n, seed);
+
+      await expect(vault.connect(keeper).claimDraw(1n))
+        .to.emit(vault, "PrizeOwed")
+        .withArgs(treasury.address, treasFee);
+
+      const dClaimed = await vault.draws(1n);
+      expect(Number(dClaimed.status)).to.eq(CLAIMED);
+      expect(await vault.isLocked()).to.eq(false);
+      expect(await vault.currentDrawId()).to.eq(2n);
+
+      // treasury amount should be pending instead of blocking the draw
+      expect(await vault.prizeOwed(treasury.address)).to.eq(treasFee);
+
+      // winner still receives prize
+      expect(await token.balanceOf(alice.address)).to.eq(bn("900") + prize);
+
+      // treasury can claim later once unblocked
+      await token.setBlocked(treasury.address, false);
+
+      await expect(vault.connect(treasury).claimOwed())
+        .to.emit(vault, "PrizeClaimed")
+        .withArgs(treasury.address, treasFee);
+
+      expect(await vault.prizeOwed(treasury.address)).to.eq(0n);
+    });
+  });
+  //TYKO-08  -  2026 04 21 END
+
   describe("emergencyCancelDraw", function () {
+    //TYKO-02  -  2026 04 20
+    it("reverts when emergency mode is disabled", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await doc.mint(await strategy.getAddress(), bn("50"));
+
+      const end = await vault.drawEndTimestamp();
+      await time.increaseTo(end + 1n);
+
+      await vault.connect(owner).closeDraw();
+      expect(await vault.isLocked()).to.eq(true);
+
+      await expect(vault.connect(owner).emergencyCancelDraw(1n))
+        .to.be.revertedWithCustomError(vault, "EmergencyModeDisabled");
+    });
+    //TYKO-02  -  2026 04 20 END
+
     it("reverts before emergencyDelay, then cancels and starts next draw", async () => {
       const { vault, strategy, owner, alice, doc, emergencyDelay } =
         await loadFixture(fixture);
@@ -855,6 +1349,14 @@ describe("PrizeVault", function () {
 
       await vault.connect(owner).closeDraw();
       expect(await vault.isLocked()).to.eq(true);
+
+      //TYKO-01  -  2026 04 20
+      // New: If there is no active emergency mode, it must first fail because of that.
+      await expect(vault.connect(owner).emergencyCancelDraw(1n))
+        .to.be.revertedWithCustomError(vault, "EmergencyModeDisabled");
+
+      await vault.connect(owner).setEmergencyMode(true);
+      //TYKO-01  -  2026 04 20 END
 
       await expect(vault.connect(owner).emergencyCancelDraw(1n))
         .to.be.revertedWithCustomError(vault, "EmergencyDelayNotPassed");
@@ -926,6 +1428,14 @@ describe("PrizeVault", function () {
     expect(Number(d.status)).to.eq(AWARDED);
     expect(d.awardedAt).to.not.eq(0n);
 
+    //TYKO-02  -  2026 04 20
+    // NEW: now requires emergency mode to be active
+    await expect(vault.connect(owner).emergencyCancelDraw(1n))
+      .to.be.revertedWithCustomError(vault, "EmergencyModeDisabled");
+
+    await vault.connect(owner).setEmergencyMode(true);
+    //TYKO-02  -  2026 04 20 END
+
     await expect(vault.connect(owner).emergencyCancelDraw(1n))
       .to.be.revertedWithCustomError(vault, "EmergencyDelayNotPassed");
 
@@ -954,12 +1464,14 @@ describe("PrizeVault", function () {
     await vault.connect(owner).closeDraw();
     expect(await vault.isLocked()).to.eq(true);
 
+    await vault.connect(owner).setEmergencyMode(true);//TYKO-02  -  2026 04 20
+
     await expect(vault.connect(keeper).emergencyCancelDraw(1n))
       .to.be.revertedWithCustomError(vault, "OwnableUnauthorizedAccount")
       .withArgs(keeper.address);
   });
 
-  it("emergencyMode: deposit/close blocked, withdraw allowed, tickets go stale; repair fixes tickets", async () => {
+  it("emergencyMode blocks deposit/withdraw/close and tickets remain consistent", async () => { //TYKO-01  -  2026 04 20
     const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
 
     await vault.connect(owner).setStrategy(await strategy.getAddress());
@@ -979,18 +1491,22 @@ describe("PrizeVault", function () {
     await expect(vault.connect(owner).closeDraw())
       .to.be.revertedWithCustomError(vault, "EmergencyModeEnabled");
 
-    await vault.connect(alice).withdraw(bn("40"));
-    expect(await vault.totalPrincipal()).to.eq(bn("60"));
-    expect(await vault.totalTickets()).to.eq(bn("100")); // stale on purpose
+    //TYKO-02  -  2026 04 20
+    await expect(vault.connect(alice).withdraw(bn("40")))
+      .to.be.revertedWithCustomError(vault, "EmergencyModeEnabled");
+
+    await expect(vault.connect(alice).withdrawAll())
+      .to.be.revertedWithCustomError(vault, "EmergencyModeEnabled");
+
+    // There is no desync: main and tickets remain the same
+    expect(await vault.totalPrincipal()).to.eq(bn("100"));
+    expect(await vault.totalTickets()).to.eq(bn("100"));
 
     await vault.connect(owner).setEmergencyMode(false);
 
-    await vault.connect(owner).startFenwickRepair();
-    await vault.connect(owner).continueFenwickRepair(1_000_000);
-    await vault.connect(owner).continueFenwickRepair(1_000_000);
-
     expect(await vault.totalTickets()).to.eq(await vault.totalPrincipal());
-    expect(await vault.totalTickets()).to.eq(bn("60"));
+    expect(await vault.totalTickets()).to.eq(bn("100"));
+    //TYKO-02  -  2026 04 20 END
   });
 
   it("fenwick repair: blocks deposit/withdraw/close while in progress", async () => {
@@ -1120,5 +1636,59 @@ describe("PrizeVault", function () {
       }
     });
   });
+  // TYKO-03 -  2026 04 21   
+  it("awardDrawManual: reverts when bridge is configured", async () => {
+    const [owner, treasury, keeper, alice] = await ethers.getSigners();
 
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    const doc = await MockERC20.deploy("Mock DOC", "DOC", 18);
+    await doc.waitForDeployment();
+
+    await doc.mint(alice.address, bn("1000"));
+
+    const MockBridge = await ethers.getContractFactory("MockBridge");
+    const bridge = await MockBridge.deploy();
+    await bridge.waitForDeployment();
+
+    const PrizeVault = await ethers.getContractFactory("PrizeVault");
+    const vault = await PrizeVault.deploy(
+      await doc.getAddress(),
+      "TYKORA Share",
+      "tDOC",
+      owner.address,
+      treasury.address,
+      TEST_DRAW_PERIOD,
+      TEST_MIN_HOLD,
+      TEST_TREASURY_BPS,
+      TEST_KEEPER_BPS,
+      TEST_BTC_CONFIRMATIONS,
+      TEST_EMERGENCY_DELAY,
+      await bridge.getAddress()
+    );
+    await vault.waitForDeployment();
+
+    const MockStrategy = await ethers.getContractFactory("MockStrategy");
+    const strategy = await MockStrategy.deploy(
+      await vault.getAddress(),
+      await doc.getAddress()
+    );
+    await strategy.waitForDeployment();
+
+    await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+    await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+    await vault.connect(alice).deposit(bn("100"));
+
+    await doc.mint(await strategy.getAddress(), bn("10"));
+
+    const end = await vault.drawEndTimestamp();
+    await time.increaseTo(end + 1n);
+
+    await vault.connect(owner).closeDraw();
+
+    await expect(
+      vault.connect(owner).awardDrawManual(1n, ethers.id("manual-seed"))
+    ).to.be.revertedWithCustomError(vault, "ManualAwardDisabled");
+  });
+  // TYKO-03 -  2026 04 21 END
 });
