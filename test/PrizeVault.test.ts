@@ -298,7 +298,163 @@ describe("PrizeVault", function () {
   });
   //TYKO-01  -  2026 04 20
 
-    describe("constructor", function () {
+  //TYKO-10  -  2026 04 30
+  describe("TYKO-10 _pickWinnersDistinct remaining=0 handling", function () {
+    it("does not revert when the only participant is ineligible; winnersCount=0", async () => {
+      const { vault, strategy, owner, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Alice deposits after cutoff => ineligible for current draw
+      await advancePastCutoff(vault);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      // add yield so draw actually locks and awards
+      await doc.mint(await strategy.getAddress(), bn("10"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      const seed = ethers.id("tyko-10-single-ineligible");
+      await expect(vault.connect(owner).awardDrawManual(1n, seed))
+        .to.emit(vault, "DrawAwarded");
+
+      const [wc, winnersFixed, prizes] = await vault.getWinners(1n);
+      const winnersCount = Number(wc);
+
+      expect(winnersCount).to.eq(0);
+      expect(winnersFixed[0]).to.eq(ethers.ZeroAddress);
+      expect(winnersFixed[1]).to.eq(ethers.ZeroAddress);
+      expect(winnersFixed[2]).to.eq(ethers.ZeroAddress);
+      expect(prizes[0]).to.eq(0n);
+      expect(prizes[1]).to.eq(0n);
+      expect(prizes[2]).to.eq(0n);
+    });
+
+    it("does not revert when all participants are ineligible; winnersCount=0", async () => {
+      const { vault, strategy, owner, alice, bob, carol, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Everyone deposits after cutoff => nobody is eligible
+      await advancePastCutoff(vault);
+
+      for (const u of [alice, bob, carol]) {
+        await doc.connect(u).approve(await vault.getAddress(), bn("100"));
+        await vault.connect(u).deposit(bn("100"));
+      }
+
+      await doc.mint(await strategy.getAddress(), bn("30"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      const seed = ethers.id("tyko-10-all-ineligible");
+      await expect(vault.connect(owner).awardDrawManual(1n, seed))
+        .to.emit(vault, "DrawAwarded");
+
+      const [wc] = await vault.getWinners(1n);
+      expect(Number(wc)).to.eq(0);
+    });
+
+    it("does not revert when fewer than 3 users are eligible; returns only eligible winners", async () => {
+      const { vault, strategy, owner, alice, bob, carol, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Alice deposits early => eligible
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      // Bob and Carol deposit after cutoff => ineligible
+      await advancePastCutoff(vault);
+
+      await doc.connect(bob).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(bob).deposit(bn("100"));
+
+      await doc.connect(carol).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(carol).deposit(bn("100"));
+
+      await doc.mint(await strategy.getAddress(), bn("30"));
+
+      await advanceToDrawEnd(vault);
+      await vault.connect(owner).closeDraw();
+
+      const seed = ethers.id("tyko-10-one-eligible");
+      await expect(vault.connect(owner).awardDrawManual(1n, seed))
+        .to.emit(vault, "DrawAwarded");
+
+      const [wc, winnersFixed] = await vault.getWinners(1n);
+      const winnersCount = Number(wc);
+      const winners = (winnersFixed as unknown as string[])
+        .slice(0, winnersCount)
+        .map((w) => w.toLowerCase());
+
+      expect(winnersCount).to.eq(1);
+      expect(winners[0]).to.eq(alice.address.toLowerCase());
+    });
+
+    it("does not revert when minHoldForEligibility == drawPeriod and no one qualifies", async () => {
+      const [owner, treasury, keeper, alice] = await ethers.getSigners();
+
+      const MockERC20 = await ethers.getContractFactory("MockERC20");
+      const doc = await MockERC20.deploy("Mock DOC", "DOC", 18);
+      await doc.waitForDeployment();
+
+      await doc.mint(alice.address, bn("1000"));
+
+      const PrizeVault = await ethers.getContractFactory("PrizeVault");
+      const vault = await PrizeVault.deploy(
+        await doc.getAddress(),
+        "TYKORA Share",
+        "tDOC",
+        owner.address,
+        treasury.address,
+        TEST_DRAW_PERIOD,
+        TEST_DRAW_PERIOD, // minHold == drawPeriod
+        TEST_TREASURY_BPS,
+        TEST_KEEPER_BPS,
+        TEST_BTC_CONFIRMATIONS,
+        TEST_EMERGENCY_DELAY,
+        ethers.ZeroAddress
+      );
+      await vault.waitForDeployment();
+
+      const MockStrategy = await ethers.getContractFactory("MockStrategy");
+      const strategy = await MockStrategy.deploy(
+        await vault.getAddress(),
+        await doc.getAddress()
+      );
+      await strategy.waitForDeployment();
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Deposit after draw has already started => not eligible when hold == full draw period
+      await time.increase(1n);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      await doc.mint(await strategy.getAddress(), bn("10"));
+
+      const end = await vault.drawEndTimestamp();
+      await time.increaseTo(end + 1n);
+
+      await vault.connect(owner).closeDraw();
+
+      const seed = ethers.id("tyko-10-hold-equals-draw");
+      await expect(vault.connect(owner).awardDrawManual(1n, seed))
+        .to.emit(vault, "DrawAwarded");
+
+      const [wc] = await vault.getWinners(1n);
+      expect(Number(wc)).to.eq(0);
+    });
+  });
+  //TYKO-10  -  2026 04 30 END
+
+  describe("constructor", function () {
     it("reverts on zero addresses / invalid params", async () => {
       const { owner, treasury, doc } = await loadFixture(fixture);
       const PrizeVault = await ethers.getContractFactory("PrizeVault");
@@ -1175,7 +1331,7 @@ describe("PrizeVault", function () {
         .to.be.revertedWithCustomError(vault, "BridgeNotSet");
     });
 
-    it("option A: whale dominance still yields 3 distinct winners with segment exclusion sampling", async () => {
+    it("option A: whale dominance may return fewer than 3 winners, but never reverts and winners remain distinct", async () => {
       const { vault, strategy, owner, alice, bob, carol, doc } = await loadFixture(fixture);
 
       await vault.connect(owner).setStrategy(await strategy.getAddress());
@@ -1197,28 +1353,85 @@ describe("PrizeVault", function () {
 
       await doc.mint(await strategy.getAddress(), bn("10"));
 
-      await advanceToDrawEnd(vault);//TYKO-01  -  2026 04 20
+      await advanceToDrawEnd(vault);
 
       await vault.connect(owner).closeDraw();
       expect(await vault.isLocked()).to.eq(true);
 
-      const seed = ethers.id("whale-segment-exclusion-seed");//TYKO-01  -  2026 04 20
-      await vault.connect(owner).awardDrawManual(1n, seed);
+      const seed = ethers.id("whale-bounded-rejection-seed");
+      await expect(vault.connect(owner).awardDrawManual(1n, seed))
+        .to.emit(vault, "DrawAwarded");
 
       const [wc, winnersFixed] = await vault.getWinners(1n);
       const winnersCount = Number(wc);
-      //TYKO-01  -  2026 04 20
       const winnersArr = (winnersFixed as unknown as string[])
         .slice(0, winnersCount)
         .map((w) => w.toLowerCase());
 
-      expect(winnersCount).to.eq(3);
-      expect(uniq(winnersArr).length).to.eq(3);
+      expect(winnersCount).to.be.gte(1);
+      expect(winnersCount).to.be.lte(3);
+      expect(uniq(winnersArr).length).to.eq(winnersCount);
 
-      expect(winnersArr).to.include(alice.address.toLowerCase());
-      expect(winnersArr).to.include(bob.address.toLowerCase());
-      expect(winnersArr).to.include(carol.address.toLowerCase());
-      //TYKO-01  -  2026 04 20 END
+      for (const w of winnersArr) {
+        expect([
+          alice.address.toLowerCase(),
+          bob.address.toLowerCase(),
+          carol.address.toLowerCase(),
+        ]).to.include(w);
+      }
+    });
+    it("claimDraw with 0 winners rolls undistributed prize into the next draw yield", async () => {
+      const { vault, strategy, owner, treasury, keeper, alice, doc } = await loadFixture(fixture);
+
+      await vault.connect(owner).setStrategy(await strategy.getAddress());
+
+      // Alice deposits after cutoff => ineligible
+      await advancePastCutoff(vault);
+
+      await doc.connect(alice).approve(await vault.getAddress(), bn("100"));
+      await vault.connect(alice).deposit(bn("100"));
+
+      // generate yield so draw closes locked
+      await doc.mint(await strategy.getAddress(), bn("40"));
+
+      await advanceToDrawEnd(vault);
+
+      await vault.connect(owner).closeDraw();
+      expect(await vault.isLocked()).to.eq(true);
+
+      const dClosed = await vault.draws(1n);
+      const treasFee = dClosed.treasuryFee;
+      const keepTip = dClosed.keeperTip;
+      const prize = dClosed.prize;
+
+      expect(prize).to.be.gt(0n);
+
+      // No eligible winners
+      const seed = ethers.id("zero-winners-rollover-seed");
+      await vault.connect(owner).awardDrawManual(1n, seed);
+
+      const [wc, , prizes] = await vault.getWinners(1n);
+      expect(Number(wc)).to.eq(0);
+      expect(prizes[0]).to.eq(0n);
+      expect(prizes[1]).to.eq(0n);
+      expect(prizes[2]).to.eq(0n);
+
+      const preTreas = await doc.balanceOf(treasury.address);
+      const preKeeper = await doc.balanceOf(keeper.address);
+
+      await vault.connect(keeper).claimDraw(1n);
+
+      // treasury + keeper still get paid
+      expect((await doc.balanceOf(treasury.address)) - preTreas).to.eq(treasFee);
+      expect((await doc.balanceOf(keeper.address)) - preKeeper).to.eq(keepTip);
+
+      // draw completed and next one started
+      expect(await vault.isLocked()).to.eq(false);
+      expect(await vault.currentDrawId()).to.eq(2n);
+
+      // prize stays idle in vault and becomes next draw yield
+      expect(await doc.balanceOf(await vault.getAddress())).to.eq(prize);
+      expect(await vault.currentYield()).to.eq(prize);
     });
   });
 

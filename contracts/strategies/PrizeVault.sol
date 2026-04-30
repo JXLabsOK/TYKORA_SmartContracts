@@ -143,6 +143,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     // ---------- draw state ----------
     enum DrawStatus { OPEN, CLOSED, AWARDED, CLAIMED }
     uint8 internal constant NUM_WINNERS = 3;
+    uint16 internal constant MAX_WINNER_TRIES = 64; //TYKO-11  -  2026 04 30
 
     struct DrawInfo {
         DrawStatus status;
@@ -172,14 +173,7 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         uint256[3] winnerPrizes;       // ordered amounts (sum == prize)
         address treasuryRecipient;     // snapshot treasury at close
     }
-    //TYKO-01  -  2026 04 20
-    /// @dev Ticket segment representation in the original cumulative ticket space.
-    struct Segment {
-        uint256 start;
-        uint256 len; // segment is [start, start + len)
-    }
-    //TYKO-01  -  2026 04 20 END
-
+    
     uint256 public currentDrawId;
     uint64 public currentDrawStart;
 
@@ -651,14 +645,25 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
     }
 
     //TYKO-01  -  2026 04 20
-    /// @dev Pick exactly up to 3 distinct eligible winners without rebuilding the Fenwick tree.
-    /// Segment-exclusion sampling:
-    /// - When an ineligible/invalid/duplicate address is hit, we exclude its entire ticket segment
-    ///   [prefix(idx-1), prefix(idx)) from the sampling space.
-    /// - We then sample uniformly over the remaining space and map back to the original space.
+    /// @dev Picks up to 3 distinct eligible winners using bounded rejection sampling.
     ///
-    /// Note: this function will return < 3 winners only if it cannot find enough eligible distinct
-    /// winners within the attempt bounds (or if fewer than 3 eligible holders exist in practice).
+    /// For each winner slot:
+    /// - sample a ticket index uniformly in `[0, tickets)` using `keccak256(seed, slot, attempt) % tickets`
+    /// - map it to a holder through the Fenwick tree
+    /// - accept the holder only if:
+    ///   - the address is valid
+    ///   - the holder has non-zero weight
+    ///   - the holder is eligible under the cooldown rule
+    ///   - the holder was not already selected in a previous winner slot
+    ///
+    /// The search is bounded by `MAX_WINNER_TRIES` per slot to keep gas usage predictable
+    /// and below the RSK block gas limit under adversarial conditions.
+    ///
+    /// Trade-off:
+    /// this approach does not guarantee exactly 3 winners in every draw. In edge cases
+    /// with few eligible users, many ineligible JIT deposits, or highly concentrated ticket
+    /// distributions, the function may return fewer than 3 winners instead of reverting
+    /// or exceeding block gas limits.
     function _pickWinnersDistinct(
         bytes32 seed,
         uint256 tickets,
@@ -669,26 +674,15 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
         uint256 len = _idxToUser.length;
         if (len <= 1) return (winners, 0); // only dummy slot
 
-        // Excluded ticket segments in the original ticket space [0, tickets).
-        // IMPORTANT: this must be an actual memory array, not just the struct name.
-        uint256 maxExcluded = 64; // increase if you expect many exclusions in a single draw
-        Segment[] memory excluded = new Segment[](maxExcluded);
-        uint256 excludedCount = 0;
-
-        uint256 remaining = tickets;
+        //TYKO-10 & TYKO-11  -  2026 04 20
 
         for (uint8 i = 0; i < NUM_WINNERS; ) {
-            if (remaining == 0) break;
+            bool found = false;
 
-            // Try until we find a valid winner for this slot.
-            for (uint16 a = 0; a < 1024; ) {
-                // Sample uniformly over the remaining (non-excluded) ticket space.
-                uint256 y = uint256(keccak256(abi.encodePacked(seed, i, a))) % remaining;
+            for (uint16 a = 0; a < MAX_WINNER_TRIES; ) {
+                uint256 r = uint256(keccak256(abi.encodePacked(seed, i, a))) % tickets;
 
-                // Map y into the original ticket space [0, tickets) by skipping excluded segments.
-                uint256 x = _mapToOriginal(y, excluded, excludedCount);
-
-                uint256 idx = _fenwickFindByCumulative(x);
+                uint256 idx = _fenwickFindByCumulative(r);
                 if (idx == 0 || idx >= len) {
                     unchecked { ++a; }
                     continue;
@@ -697,134 +691,38 @@ contract PrizeVault is ERC20, Ownable, ReentrancyGuard {
                 address w = _idxToUser[idx];
                 uint256 wgt = _weights[idx];
 
-                // Safety checks (should not happen in a consistent Fenwick tree, but keep as guardrails).
                 if (w == address(0) || wgt == 0) {
                     unchecked { ++a; }
                     continue;
                 }
 
-                // Cooldown + sponsor eligibility check
                 if (!_isEligibleWinner(w, cutoff)) {
-                    (uint256 segStart, uint256 segLen) = _segmentForIndex(idx, wgt);
-
-                    uint256 prevCount = excludedCount;
-                    excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart, segLen);
-
-                    // Only shrink remaining if we successfully inserted (buffer not full / not duplicate).
-                    if (excludedCount != prevCount) {
-                        remaining -= segLen;
-                    }
-
                     unchecked { ++a; }
                     continue;
                 }
 
-                // Distinct check (also exclude duplicates to avoid re-hitting them).
                 if (count != 0) {
                     if (w == winners[0] || (count > 1 && w == winners[1])) {
-                        (uint256 segStart2, uint256 segLen2) = _segmentForIndex(idx, wgt);
-
-                        uint256 prevCount2 = excludedCount;
-                        excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart2, segLen2);
-
-                        if (excludedCount != prevCount2) {
-                            remaining -= segLen2;
-                        }
-
                         unchecked { ++a; }
                         continue;
                     }
                 }
 
-                // Valid distinct winner found.
                 winners[count] = w;
                 unchecked { ++count; }
-
-                // Exclude winner segment to enforce sampling without replacement.
-                (uint256 segStart3, uint256 segLen3) = _segmentForIndex(idx, wgt);
-
-                uint256 prevCount3 = excludedCount;
-                excludedCount = _insertSegmentSorted(excluded, excludedCount, segStart3, segLen3);
-
-                if (excludedCount != prevCount3) {
-                    remaining -= segLen3;
-                }
-
-                // Move to next winner slot.
+                found = true;
                 break;
             }
 
-            // If we failed to fill this winner slot, stop.
-            if (count < i + 1) break;
+            if (!found) break;
+            //TYKO-10 & TYKO-11  -  2026 04 20 END
 
             unchecked { ++i; }
         }
 
         return (winners, count);
-    }    
-
-    /// @dev Compute the ticket segment for a given Fenwick index.
-    /// @param idx Fenwick/user index.
-    /// @param wgt The weight at idx (_weights[idx]) to avoid a redundant SLOAD.
-    function _segmentForIndex(uint256 idx, uint256 wgt) internal view returns (uint256 start, uint256 segLen) {
-        // prefix(idx-1) gives the segment start.
-        start = _fenwickSum(idx - 1);
-        segLen = wgt; // weights map 1:1 to ticket-length in cumulative space
-    }
-
-    /// @dev Map a uniform y in [0, remaining) to x in [0, total) by skipping excluded segments.
-    /// Excluded segments must be sorted by start ascending and non-overlapping.
-    function _mapToOriginal(
-        uint256 y,
-        Segment[] memory excluded,
-        uint256 excludedCount
-    ) internal pure returns (uint256 x) {
-        x = y;
-
-        for (uint256 j = 0; j < excludedCount; ) {
-            if (x >= excluded[j].start) {
-                x += excluded[j].len;
-                unchecked { ++j; }
-            } else {
-                break;
-            }
-        }
-
-        return x;
-    }
-
-    /// @dev Insert a segment into the excluded list while keeping it sorted by start.
-    /// If the buffer is full or the segment is already present, it will be ignored.
-    function _insertSegmentSorted(
-        Segment[] memory excluded,
-        uint256 excludedCount,
-        uint256 start,
-        uint256 segLen
-    ) internal pure returns (uint256 newCount) {
-        if (segLen == 0) return excludedCount;
-        if (excludedCount >= excluded.length) return excludedCount;
-
-        // Avoid inserting duplicates (same start => same user segment).
-        for (uint256 k = 0; k < excludedCount; ) {
-            if (excluded[k].start == start) return excludedCount;
-            unchecked { ++k; }
-        }
-
-        Segment memory s = Segment({ start: start, len: segLen });
-
-        // Insertion sort (small N expected).
-        uint256 i = excludedCount;
-        while (i > 0) {
-            Segment memory prev = excluded[i - 1];
-            if (prev.start <= s.start) break;
-            excluded[i] = prev;
-            unchecked { --i; }
-        }
-        excluded[i] = s;
-
-        return excludedCount + 1;
-    }
-
+    }        
+    
     /// @dev Eligibility rules:
     /// - noTickets => always ineligible
     /// - must have non-zero shares at award time (note: this reflects *current* shares; no per-user snapshot)

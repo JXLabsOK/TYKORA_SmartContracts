@@ -1,6 +1,6 @@
 # TYKORA
 
-TYKORA is a prize-linked savings vault deployed on **Rootstock**. Users deposit **DOC (MoneyOnChain)** or **USDRIF (Rootstock)**, earn yield through an external strategy (designed for **Tropykus**), and participate in recurring prize draws where **three distinct winners** are selected using deterministic randomness anchored to **Bitcoin block headers** via the **Rootstock bridge**.
+TYKORA is a prize-linked savings vault deployed on **Rootstock**. Users deposit **DOC (MoneyOnChain)** or **USDRIF (Rootstock)**, earn yield through an external strategy designed for venues such as **Tropykus** and **Sovryn**, and participate in recurring prize draws where **up to three distinct winners** are selected using deterministic randomness anchored to **Bitcoin block headers** via the **Rootstock bridge**.
 
 **Developed by JXLabs.**
 
@@ -10,7 +10,7 @@ TYKORA is a prize-linked savings vault deployed on **Rootstock**. Users deposit 
 
 - **Deposit DOC & USDRIF, earn yield:** deposits are deployed into a yield strategy.
 - **Prize-linked savings:** yield is split into **prize / treasury / keeper**.
-- **3 winners per draw:** prize split is **50% / 30% / 20%**.
+- **Up to 3 winners per draw:** prize split is **50% / 30% / 20%**, with automatic renormalization when fewer than 3 winners are selected.
 - **BTC-anchored randomness:** seed is derived from a BTC block header hash (Rootstock bridge).
 - **Non-transferable shares:** shares represent deposit position (mint/burn only).
 - **Vault locking during settlement:** withdrawals are disabled while a draw is locked (close → award → claim).
@@ -28,7 +28,7 @@ TYKORA is a prize-linked savings vault deployed on **Rootstock**. Users deposit 
   - Selects winners weighted by shares (tickets)
   - Distributes prize + fees
 - **Strategy (IStrategy)**
-  - Receives DOC or USDRIF from the vault and deploys into an external venue (designed for Tropykus)
+  - Receives DOC or USDRIF from the vault and deploys into an external venue (for example, Tropykus or Sovryn)
   - Exposes: `deposit`, `withdrawUnderlying`, `totalUnderlying`, `accrue`
 - **Rootstock Bridge**
   - Used to fetch BTC block headers by height to derive an objective seed
@@ -64,14 +64,17 @@ To award a draw from BTC:
 2. Compute:
    - `btcHash = doubleSha256(header)`
    - `seed = keccak256(btcHash, vaultAddress, drawId)`
-3. Use the seed to select **three distinct winners** weighted by deposit shares (“tickets”).
+3. Use the seed to select **up to three distinct winners** weighted by deposit shares (“tickets”).
 
 Winner selection is **verifiable** by anyone using on-chain state and bridge data.
 
+Because winner selection is intentionally gas-bounded, some draws may return fewer than three winners in edge cases with few eligible users, many ineligible late deposits, or highly concentrated ticket distributions.
+
+In extreme cases, a draw may return zero winners; in that case, any undistributed prize remains in the vault and is effectively rolled into the yield available for a future draw once the current draw is claimed.
+
 ---
 
-### Modulo Reduction Note
-## TYKO-09  -  2026 04 21
+## Modulo Reduction Note
 Winner selection uses a deterministic pseudo-random value derived from `keccak256(...)` and reduced to the active ticket range.
 
 As with any modulo-based reduction, this introduces a theoretical bias whenever the random domain size is not an exact multiple of the ticket range. In practice, because the source value is 256 bits wide, the bias is negligible and has no meaningful impact on fairness or exploitability for realistic ticket counts.
@@ -89,49 +92,46 @@ This behavior is acknowledged and accepted as part of the current design.
 - Prize:
   - `prize = yield - treasuryFee - keeperTip`
 - Winners:
-  - Winner #1: 50%
-  - Winner #2: 30%
-  - Winner #3: 20%
-  - Any integer division remainder is assigned to Winner #1.
+  - If 3 winners are selected: Winner #1 = 50%, Winner #2 = 30%, Winner #3 = 20%
+  - If 2 winners are selected: the prize is renormalized to **5/8** and **3/8**
+  - If 1 winner is selected: the winner receives **100%** of the prize
 
 ---
-## TYKO-04  -  2026 04 21
-## Dependency on Tropykus Liquidity and Exchange Rate
+## Dependency on External Strategy Liquidity and Exchange Rate
 
-Tykora depends on the Tropykus lending market to source yield and to redeem underlying assets when settling draws and processing withdrawals.
+Tykora depends on the liquidity and exchange-rate behavior of the active external strategy venue to source yield and to redeem underlying assets when settling draws and processing withdrawals. Depending on deployment, this may include venues such as Tropykus or Sovryn.
 
 ### Draw settlement dependency
-When a draw is closed, the vault may need to redeem underlying from the strategy in order to reserve the prize, treasury fee, and keeper tip. If Tropykus liquidity is temporarily insufficient, draw settlement may revert and remain pending until liquidity becomes available again.
+When a draw is closed, the vault may need to redeem underlying from the strategy in order to reserve the prize, treasury fee, and keeper tip. If the active strategy venue has temporarily insufficient liquidity, draw settlement may revert and remain pending until liquidity becomes available again.
 
 ### Withdrawal dependency
-User withdrawals also depend on the amount of underlying liquidity that can be redeemed from Tropykus at that moment. During periods of high utilization, withdrawals may be delayed or unavailable depending on idle liquidity and redeemable funds.
+User withdrawals also depend on the amount of underlying liquidity that can be redeemed from the active strategy venue at that moment. During periods of high utilization, withdrawals may be delayed or unavailable depending on idle liquidity and redeemable funds.
 
 ### High utilization risk
-In high-utilization conditions, Tropykus may not have enough available cash to satisfy redemptions immediately. In that case:
+In high-utilization conditions, the active strategy venue may not have enough available cash to satisfy redemptions immediately. In that case:
 - `closeDraw()` may revert and the draw may remain open until liquidity recovers.
-- Withdrawals that require redeeming funds from the lending market may also revert until liquidity improves.
+- Withdrawals that require redeeming funds from the active strategy venue may also revert until liquidity improves.
 
 This condition is generally expected to be temporary in money-market systems, since elevated borrow rates tend to incentivize repayments and restore liquidity over time.
 
 ### Bad debt / exchange rate risk
-If bad debt is socialized at the lending-market level and the kToken exchange rate decreases, Tykora’s total assets may fall relative to total principal. In that situation:
+If bad debt is socialized at the lending-market level and the strategy position exchange rate decreases, Tykora’s total assets may fall relative to total principal. In that situation:
 - A draw may finalize with zero distributable yield.
 - Withdrawals may eventually fail once the remaining redeemable balance is exhausted.
 
 Unlike short-term utilization spikes, a bad debt event may not self-correct, because the loss is already realized in the exchange rate.
 
 ### User and integrator note
-Tykora does not guarantee instant liquidity independently of Tropykus. Draw settlement and withdrawals are economically and technically dependent on:
-- Tropykus pool liquidity
+Tykora does not guarantee instant liquidity independently of the active external strategy venue. Draw settlement and withdrawals are economically and technically dependent on:
+- strategy venue liquidity
 - the redeemability of underlying assets
-- the kToken exchange rate
+- the exchange-rate behavior of the strategy position
 
-Users and integrators should treat Tropykus market conditions as an external dependency of the protocol.
+Users and integrators should treat external strategy venue conditions as an external dependency of the protocol.
 
 ### Future consideration
 A future version of Tykora may evaluate a mechanism to account for and socialize lending-market bad debt across depositors at the protocol level.
 
-## TYKO-06  -  2026 04 21
 ## Yield Roll-Over When No Depositors Remain
 
 Tykora calculates distributable yield at draw close as the difference between `totalAssets()` and `totalPrincipal`.
